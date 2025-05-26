@@ -343,11 +343,12 @@ def load_lifesense_csvs(folder):
 def load_data(lsl_dir, capnograph_dir, fnirs_landmarks_pos_dir=None):
     """
     Read LSL and Capnograph files and return the synchronized data and metadata.
+    Synchronizes all streams to start from the first 'prep_bhb' PsychoPy marker.
     """
-
+    
     # Load the LSL file
     streams, header = pyxdf.load_xdf(lsl_dir)
-
+    
     # Extract the data, timestamps, and metadata from each stream
     for stream in streams:
         name = stream['info']['name'][0]
@@ -363,46 +364,166 @@ def load_data(lsl_dir, capnograph_dir, fnirs_landmarks_pos_dir=None):
             unix_time_data, unix_time_ts, unix_time_metadata = read_stream(stream)
         if name =='Aurora_accelerometer':
             aurora_acc_data, aurora_acc_ts, aurora_acc_metadata = read_stream(stream)
+    
+    # Find the first 'prep_bhb' marker timestamp
+    prep_bhb_index = None
+    for i in range(len(markers_data)):
+        if markers_data[i] == ['prep_bhb']:  # Keep brackets since markers are stored as lists
+            prep_bhb_index = i
+            break
+    
+    if prep_bhb_index is None:
+        raise ValueError("prep_bhb marker not found in PsychoPy markers!")
+    
+    t0 = markers_ts[prep_bhb_index]
+    print(f"Setting t0 to first prep_bhb marker at timestamp: {t0}")
+    
+    # Function to filter data from t0 onwards and adjust timestamps
+    def filter_and_adjust_stream(data, timestamps, t0):
+        """Filter data to keep only samples from t0 onwards and adjust timestamps"""
+        # Find indices where timestamps >= t0
+        valid_indices = timestamps >= t0
+        
+        # Convert to numpy array if it's a list
+        if isinstance(data, list):
+            data = np.array(data)
+        
+        # Filter data and timestamps
+        if data.ndim == 1:
+            filtered_data = data[valid_indices]
+        else:
+            filtered_data = data[valid_indices, :]
+        filtered_timestamps = timestamps[valid_indices] - t0  # Subtract t0 to start from 0
+        
+        return filtered_data, filtered_timestamps
+    
+    # Apply filtering and time adjustment to all streams
+    fnirs_data, fnirs_ts = filter_and_adjust_stream(fnirs_data, fnirs_ts, t0)
+    liveamp_data, liveamp_ts = filter_and_adjust_stream(liveamp_data, liveamp_ts, t0)
+    #flattened_buttons_data = [item[0].replace('_', ' ') if i == 0 else item[0] for i, item in enumerate(buttons_data)]
+    flattened_buttons_data = [item[0] for item in buttons_data]
+    buttons_data, buttons_ts = filter_and_adjust_stream(flattened_buttons_data, buttons_ts, t0)
+    unix_time_data, unix_time_ts = filter_and_adjust_stream(unix_time_data, unix_time_ts, t0)
+    aurora_acc_data, aurora_acc_ts = filter_and_adjust_stream(aurora_acc_data, aurora_acc_ts, t0)
 
-    # Load de Canograph data
+    first_marker_unix = unix_time_data[0][0] # we can use this to sync the capnograph data
+    
+    # For markers, we need special handling since we want to keep the marker from prep_bhb onwards
+    markers_valid_indices = np.where(markers_ts >= t0)[0]  # Get integer indices instead of boolean mask
+    markers_data = [markers_data[i] for i in markers_valid_indices]  # Use list comprehension for Python list
+    markers_ts = markers_ts[markers_valid_indices] - t0
+    
+    # Load the Capnograph data
     gd_ds, cw_xr, pt_xr = load_lifesense_csvs(capnograph_dir)
+    # TODO: Filter capnograph data based on t0 (needs previous mapping to LSL timestamp)
+    # Here, we cut off data from before the onset of the first PsychoPy marker (prep_bhb)
+    gd_ds = gd_ds.sel(time=slice(first_marker_unix - 20, None))  # 20sec buffer added
+    cw_xr = cw_xr.sel(time=slice(first_marker_unix - 20, None))
+    pt_xr = pt_xr.sel(time=slice(first_marker_unix - 20, None))
+    # Here, we do the cross-correlation analysis
 
-    # Bring all data to the same time base
-    t0 = np.min([d[0] for d in [fnirs_ts, liveamp_ts, markers_ts, buttons_ts, unix_time_ts, aurora_acc_ts]])
-    fnirs_ts -= t0
-    liveamp_ts -= t0
-    markers_ts -= t0
-    buttons_ts -= t0
-    unix_time_ts -= t0
-    aurora_acc_ts -= t0
-    # TODO: Do the same for the capnograph data (needs previous mapped to lsl timestamp)
 
+    
+    # Print info about data retention
+    print(f"Data retained from t0 onwards:")
+    print(f"  fNIRS: {len(fnirs_ts)} samples")
+    print(f"  LiveAmp: {len(liveamp_ts)} samples") 
+    print(f"  Markers: {len(markers_ts)} samples")
+    print(f"  Buttons: {len(buttons_ts)} samples")
+    print(f"  UnixTime: {len(unix_time_ts)} samples")
+    print(f"  Aurora Acc: {len(aurora_acc_ts)} samples")
+    
     # Read only the OD data
     fnirs_data = read_od(fnirs_data)
     # Read fnirs metadata to extract: channels, wavelengths, and montage
     fnirs_channels, wl1, wl2, fnirs_geo3d = read_fnirs_metadata(fnirs_metadata, fnirs_landmarks_pos_dir)
     # Convert to xr
     fnirs_xr = build_fnirs_xr(fnirs_data, fnirs_ts, fnirs_channels, wl1, wl2)
-
+    
     # Read EEG metadata to extract: channels, and montage
     liveamp_channels = read_eeg_metadata(liveamp_metadata)
     # Read electrode data and convert to mne
     electrodes_mne = build_eeg_mne(liveamp_data.T, liveamp_ts, liveamp_channels)
     # Read liveamp auxiliary data
     liveamp_aux_xr = build_liveamp_aux(liveamp_data.T, liveamp_ts, liveamp_channels)
-
+    
     # Read Aurora Accelerometer LSL data
     aurora_acc_channels = read_eeg_metadata(aurora_acc_metadata)
     aurora_acc_xr = build_liveamp_aux(aurora_acc_data.T, aurora_acc_ts, aurora_acc_channels)
-
-
+    
     # Convert markers to pandas
     markers_data = markers_to_pandas(markers_data, markers_ts)
-
+    
     # Convert buttons to pandas
     buttons_data = buttons_to_pandas(buttons_data, buttons_ts)
+    
+    return fnirs_xr, fnirs_geo3d, electrodes_mne, liveamp_aux_xr, gd_ds, cw_xr, pt_xr, markers_data, buttons_data, aurora_acc_xr, first_marker_unix
 
-    return fnirs_xr, fnirs_geo3d, electrodes_mne, liveamp_aux_xr, gd_ds, cw_xr, pt_xr, markers_data, buttons_data, aurora_acc_xr
+
+# OLD VERSION
+# def load_data(lsl_dir, capnograph_dir, fnirs_landmarks_pos_dir=None):
+#     """
+#     Read LSL and Capnograph files and return the synchronized data and metadata.
+#     """
+
+#     # Load the LSL file
+#     streams, header = pyxdf.load_xdf(lsl_dir)
+
+#     # Extract the data, timestamps, and metadata from each stream
+#     for stream in streams:
+#         name = stream['info']['name'][0]
+#         if name == 'EspArgos_ButtonPress':
+#             buttons_data, buttons_ts, buttons_metadata = read_stream(stream)
+#         if name == 'Aurora':
+#             fnirs_data, fnirs_ts, fnirs_metadata = read_stream(stream)
+#         if name == 'LiveAmpSN-101410-1017':
+#             liveamp_data, liveamp_ts, liveamp_metadata = read_stream(stream)
+#         if name == 'PsychoPyMarker':
+#             markers_data, markers_ts, markers_metadata = read_stream(stream)
+#         if name == 'UnixTime_s':
+#             unix_time_data, unix_time_ts, unix_time_metadata = read_stream(stream)
+#         if name =='Aurora_accelerometer':
+#             aurora_acc_data, aurora_acc_ts, aurora_acc_metadata = read_stream(stream)
+
+#     # Load de Canograph data
+#     gd_ds, cw_xr, pt_xr = load_lifesense_csvs(capnograph_dir)
+
+#     # Bring all data to the same time base
+#     t0 = np.min([d[0] for d in [fnirs_ts, liveamp_ts, markers_ts, buttons_ts, unix_time_ts, aurora_acc_ts]])
+#     fnirs_ts -= t0
+#     liveamp_ts -= t0
+#     markers_ts -= t0
+#     buttons_ts -= t0
+#     unix_time_ts -= t0
+#     aurora_acc_ts -= t0
+#     # TODO: Do the same for the capnograph data (needs previous mapped to lsl timestamp)
+
+#     # Read only the OD data
+#     fnirs_data = read_od(fnirs_data)
+#     # Read fnirs metadata to extract: channels, wavelengths, and montage
+#     fnirs_channels, wl1, wl2, fnirs_geo3d = read_fnirs_metadata(fnirs_metadata, fnirs_landmarks_pos_dir)
+#     # Convert to xr
+#     fnirs_xr = build_fnirs_xr(fnirs_data, fnirs_ts, fnirs_channels, wl1, wl2)
+
+#     # Read EEG metadata to extract: channels, and montage
+#     liveamp_channels = read_eeg_metadata(liveamp_metadata)
+#     # Read electrode data and convert to mne
+#     electrodes_mne = build_eeg_mne(liveamp_data.T, liveamp_ts, liveamp_channels)
+#     # Read liveamp auxiliary data
+#     liveamp_aux_xr = build_liveamp_aux(liveamp_data.T, liveamp_ts, liveamp_channels)
+
+#     # Read Aurora Accelerometer LSL data
+#     aurora_acc_channels = read_eeg_metadata(aurora_acc_metadata)
+#     aurora_acc_xr = build_liveamp_aux(aurora_acc_data.T, aurora_acc_ts, aurora_acc_channels)
+
+
+#     # Convert markers to pandas
+#     markers_data = markers_to_pandas(markers_data, markers_ts)
+
+#     # Convert buttons to pandas
+#     buttons_data = buttons_to_pandas(buttons_data, buttons_ts)
+
+#     return fnirs_xr, fnirs_geo3d, electrodes_mne, liveamp_aux_xr, gd_ds, cw_xr, pt_xr, markers_data, buttons_data, aurora_acc_xr
 
 
 
