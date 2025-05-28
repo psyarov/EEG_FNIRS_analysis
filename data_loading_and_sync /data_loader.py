@@ -375,8 +375,9 @@ def load_data(lsl_dir, capnograph_dir, fnirs_landmarks_pos_dir=None):
     if prep_bhb_index is None:
         raise ValueError("prep_bhb marker not found in PsychoPy markers!")
     
-    t0 = markers_ts[prep_bhb_index]
-    print(f"Setting t0 to first prep_bhb marker at timestamp: {t0}")
+    # Set t0 to 20s before onset of prep_bhb (added buffer for later analysis)
+    t0 = markers_ts[prep_bhb_index] - 20
+    print(f"Setting t0(=0.0s) to 20s before first prep_bhb marker at timestamp: {t0}")
     
     # Function to filter data from t0 onwards and adjust timestamps
     def filter_and_adjust_stream(data, timestamps, t0):
@@ -407,6 +408,8 @@ def load_data(lsl_dir, capnograph_dir, fnirs_landmarks_pos_dir=None):
     aurora_acc_data, aurora_acc_ts = filter_and_adjust_stream(aurora_acc_data, aurora_acc_ts, t0)
 
     first_marker_unix = unix_time_data[0][0] # we can use this to sync the capnograph data
+    first_marker_unix_ts = unix_time_ts[0]
+    t0_unix = first_marker_unix - first_marker_unix_ts # This is t0 (essentially 0.0s of the data we retain) in unix time
     
     # For markers, we need special handling since we want to keep the marker from prep_bhb onwards
     markers_valid_indices = np.where(markers_ts >= t0)[0]  # Get integer indices instead of boolean mask
@@ -416,10 +419,11 @@ def load_data(lsl_dir, capnograph_dir, fnirs_landmarks_pos_dir=None):
     # Load the Capnograph data
     gd_ds, cw_xr, pt_xr = load_lifesense_csvs(capnograph_dir)
     # TODO: Filter capnograph data based on t0 (needs previous mapping to LSL timestamp)
-    # Here, we cut off data from before the onset of the first PsychoPy marker (prep_bhb)
-    gd_ds = gd_ds.sel(time=slice(first_marker_unix - 20, None))  # 20sec buffer added
-    cw_xr = cw_xr.sel(time=slice(first_marker_unix - 20, None))
-    pt_xr = pt_xr.sel(time=slice(first_marker_unix - 20, None))
+    # Here, we cut off data from before the onset of the first PsychoPy marker(prep_bhb)
+    gd_ds = gd_ds.sel(time=slice(t0_unix, None))  # no buffer currently! (a few seconds of data may be lost)
+    cw_xr = cw_xr.sel(time=slice(t0_unix, None)) # There is a delay of roughly 29s (0:50s in co2 data is actually 0:21s in time-synced data)
+    cw_xr = cw_xr.assign_coords(time=cw_xr.time - t0_unix - 20) # Adjust co2 data to be on the same timeline with 0.0s onwards (delay-adjusted) [409: - 29; 779: ]
+    pt_xr = pt_xr.sel(time=slice(t0_unix, None))
     # Here, we do the cross-correlation analysis
 
 
@@ -457,7 +461,7 @@ def load_data(lsl_dir, capnograph_dir, fnirs_landmarks_pos_dir=None):
     # Convert buttons to pandas
     buttons_data = buttons_to_pandas(buttons_data, buttons_ts)
     
-    return fnirs_xr, fnirs_geo3d, electrodes_mne, liveamp_aux_xr, gd_ds, cw_xr, pt_xr, markers_data, buttons_data, aurora_acc_xr, first_marker_unix
+    return fnirs_xr, fnirs_geo3d, electrodes_mne, liveamp_aux_xr, gd_ds, cw_xr, pt_xr, markers_data, buttons_data, aurora_acc_xr, first_marker_unix, first_marker_unix_ts
 
 
 # OLD VERSION
